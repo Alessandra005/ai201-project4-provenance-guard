@@ -246,6 +246,69 @@ def get_log_entries(limit: int = 50, status: str = None):
     return [dict(r) for r in rows]
 
 
+def compute_analytics():
+    """
+    Aggregates the audit log into: detection-pattern breakdown by attribution
+    tier, the appeal rate, and signal disagreement rate (the extra metric).
+    All numbers are computed live from audit_log -- no separate storage.
+    """
+    db = get_db()
+
+    total = db.execute("SELECT COUNT(*) AS c FROM audit_log").fetchone()["c"]
+
+    if total == 0:
+        return {
+            "total_submissions": 0,
+            "detection_patterns": {},
+            "average_confidence": None,
+            "appeal_rate": None,
+            "appeal_count": 0,
+            "signal_disagreement_rate": None,
+            "signal_disagreement_count": 0,
+        }
+
+    tier_rows = db.execute(
+        "SELECT attribution, COUNT(*) AS c FROM audit_log GROUP BY attribution"
+    ).fetchall()
+    detection_patterns = {
+        row["attribution"]: {
+            "count": row["c"],
+            "percentage": round(row["c"] / total * 100, 1),
+        }
+        for row in tier_rows
+    }
+
+    avg_confidence = db.execute(
+        "SELECT AVG(confidence) AS avg_c FROM audit_log"
+    ).fetchone()["avg_c"]
+
+    appeal_count = db.execute(
+        "SELECT COUNT(*) AS c FROM audit_log WHERE status = 'under_review'"
+    ).fetchone()["c"]
+
+    # Signal disagreement rate: the two signals land on opposite sides of the
+    # 0.5 midpoint (one leans AI, the other leans human). Computed in Python
+    # since it compares two columns per row rather than a single aggregate.
+    all_rows = db.execute(
+        "SELECT llm_score, stylometric_score FROM audit_log"
+    ).fetchall()
+    disagreements = sum(
+        1
+        for row in all_rows
+        if (row["llm_score"] >= 0.5) != (row["stylometric_score"] >= 0.5)
+    )
+
+    return {
+        "total_submissions": total,
+        "detection_patterns": detection_patterns,
+        "average_confidence": round(avg_confidence, 3) if avg_confidence is not None else None,
+        "appeal_rate": round(appeal_count / total * 100, 1),
+        "appeal_count": appeal_count,
+        "signal_disagreement_rate": round(disagreements / total * 100, 1),
+        "signal_disagreement_count": disagreements,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -352,6 +415,64 @@ def log_single(content_id):
     if row is None:
         return jsonify({"error": "content_id not found"}), 404
     return jsonify(dict(row))
+
+
+@app.route("/analytics", methods=["GET"])
+def analytics():
+    return jsonify(compute_analytics())
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    data = compute_analytics()
+    if data["total_submissions"] == 0:
+        return "<h1>Provenance Guard Dashboard</h1><p>No submissions yet.</p>"
+
+    tier_rows_html = ""
+    for tier, stats in data["detection_patterns"].items():
+        bar_width = stats["percentage"]
+        tier_rows_html += f"""
+        <div class="metric-row">
+          <span class="metric-label">{tier}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:{bar_width}%"></div></div>
+          <span class="metric-value">{stats['count']} ({stats['percentage']}%)</span>
+        </div>
+        """
+
+    html = f"""
+    <html>
+    <head>
+      <title>Provenance Guard — Dashboard</title>
+      <style>
+        body {{ font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 40px auto; color: #1a1a1a; }}
+        h1 {{ font-size: 22px; }}
+        h2 {{ font-size: 16px; margin-top: 32px; color: #444; }}
+        .stat-grid {{ display: flex; gap: 24px; margin: 16px 0; }}
+        .stat-box {{ flex: 1; border: 1px solid #ddd; border-radius: 8px; padding: 16px; text-align: center; }}
+        .stat-number {{ font-size: 28px; font-weight: 700; }}
+        .stat-label {{ font-size: 12px; color: #666; margin-top: 4px; }}
+        .metric-row {{ display: flex; align-items: center; gap: 10px; margin: 8px 0; }}
+        .metric-label {{ width: 130px; font-size: 13px; }}
+        .bar-track {{ flex: 1; background: #eee; border-radius: 4px; height: 14px; overflow: hidden; }}
+        .bar-fill {{ background: #4a7cf5; height: 100%; }}
+        .metric-value {{ width: 100px; font-size: 12px; color: #444; text-align: right; }}
+      </style>
+    </head>
+    <body>
+      <h1>Provenance Guard — Analytics Dashboard</h1>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="stat-number">{data['total_submissions']}</div><div class="stat-label">Total submissions</div></div>
+        <div class="stat-box"><div class="stat-number">{data['average_confidence']}</div><div class="stat-label">Avg. confidence score</div></div>
+        <div class="stat-box"><div class="stat-number">{data['appeal_rate']}%</div><div class="stat-label">Appeal rate ({data['appeal_count']} appeals)</div></div>
+        <div class="stat-box"><div class="stat-number">{data['signal_disagreement_rate']}%</div><div class="stat-label">Signal disagreement rate</div></div>
+      </div>
+      <h2>Detection patterns by tier</h2>
+      {tier_rows_html}
+      <p style="margin-top:32px; font-size:12px; color:#888;">Live data from /analytics, computed from the audit log.</p>
+    </body>
+    </html>
+    """
+    return html
 
 
 if __name__ == "__main__":
