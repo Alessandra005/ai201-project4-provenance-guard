@@ -1,12 +1,12 @@
 # Provenance Guard
-
+ 
 A backend system that classifies submitted creative text as likely AI-generated,
 likely human-written, or uncertain — with a calibrated confidence score, a
 plain-language transparency label, an appeals workflow for contested
 classifications, rate limiting, and a structured audit log.
-
+ 
 ## Setup
-
+ 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -14,10 +14,11 @@ pip install -r requirements.txt
 cp .env.example .env   # then add your real GROQ_API_KEY
 python app.py
 ```
-Server runs at `http://localhost:5000`.
-
+ 
+Server runs at `http://localhost:5000/dashboard`.
+ 
 ## Architecture Overview
-
+ 
 A submission (`POST /submit`) is rate-limited, then run through two
 independent detection signals (an LLM judgment call via Groq, and a
 stylometric heuristic computed in pure Python). Their scores are combined
@@ -31,36 +32,36 @@ their reasoning; this sets the record's status to `under_review` and appends
 the appeal to the audit trail without any automatic re-classification.
 `GET /log` exposes the audit log for review. Full diagram and narrative are
 in [`planning.md`](./planning.md).
-
+ 
 ## Detection Signals
-
+ 
 | Signal | What it measures | Why chosen | What it misses |
 |---|---|---|---|
 | **LLM (Groq, llama-3.3-70b-versatile)** | Holistic semantic/stylistic coherence — generic hedging, formulaic transitions ("furthermore," "it is important to note"), balanced-both-sides phrasing vs. idiosyncratic human voice | Captures meaning and "feel," which structural metrics can't | Can be fooled by AI text that's been edited/humanized, or by very formal human writing (academic, business, non-native speakers) that resembles typical LLM register |
 | **Stylometric heuristics (pure Python)** | Sentence-length variance, type-token ratio (vocabulary diversity), punctuation density, combined into a single 0–1 score | Purely structural, computable with no external dependency, independent failure mode from the LLM signal | Blind to meaning entirely; unstable on short text (under ~40 words) where variance and TTR don't have enough samples to be meaningful — see Known Limitations |
-
+ 
 These two are genuinely independent: one reads for meaning, the other counts
 surface statistics, so they make different mistakes — which is the point of
 combining them rather than relying on either alone.
-
+ 
 ## Confidence Scoring
-
+ 
 **Combination:** `combined = 0.65 * llm_score + 0.35 * stylometric_score`,
 both inputs and the output on a 0–1 scale where 1 = confidently AI-generated.
-
+ 
 **Calibration approach:** rather than picking thresholds after the fact, we
 decided up front what `0.5` should *mean* to a user (genuine, irreducible
 ambiguity — not "the system is being lazy") and then set thresholds so the
 "likely AI" tier requires a higher bar than the "likely human" tier requires
 to be ruled out, since mislabeling a human creator as an AI is the worse error
 on a creative-writing platform:
-
+ 
 | Combined score | Tier |
 |---|---|
 | ≥ 0.75 | likely AI |
 | 0.35 – 0.74 | uncertain |
 | < 0.35 | likely human |
-
+ 
 **Validation:** we tested the pipeline against the four inputs in the project
 spec (clearly AI-generated, clearly human, formal-human borderline, lightly
 edited AI borderline) and confirmed the stylometric component alone produces
@@ -68,7 +69,7 @@ meaningfully different scores between the clear-cut AI and human samples, and
 that the combined score moves predictably as the LLM score is varied. The two
 example runs below were captured with `curl` against the running server
 (commands in the next section):
-
+ 
 **Higher-confidence example (AI-generated sample text):**
 ```json
 {
@@ -90,7 +91,7 @@ to note," "furthermore"). The combined score lands at "uncertain" rather than
 (`0.242`) — a real instance of the structural-signal weakness documented
 below in Known Limitations, not a scoring bug. It's an honest example of how
 the two signals can disagree.
-
+ 
 **Lower-confidence example (clearly human-written sample text):**
 ```json
 {
@@ -109,51 +110,51 @@ Here both signals agree (`llm_score: 0.1`, `stylometric_score: 0.2`), producing
 a low, confident combined score and the "likely human" label — a clean case
 showing the scores move meaningfully (0.135 vs. 0.67 above) rather than
 clustering around a constant.
-
+ 
 ### How to reproduce the evidence above
-
+ 
 ```bash
 # Clearly AI-generated
 curl -s -X POST http://localhost:5000/submit -H "Content-Type: application/json" -d '{
   "text": "Artificial intelligence represents a transformative paradigm shift in modern society. It is important to note that while the benefits of AI are numerous, it is equally essential to consider the ethical implications. Furthermore, stakeholders across various sectors must collaborate to ensure responsible deployment.",
   "creator_id": "test-ai"
 }' | python -m json.tool
-
+ 
 # Clearly human-written
 curl -s -X POST http://localhost:5000/submit -H "Content-Type: application/json" -d '{
   "text": "ok so i finally tried that new ramen place downtown and honestly? underwhelming. the broth was fine but they put WAY too much sodium in it and i was thirsty for like three hours after. my friend got the spicy version and said it was better. probably wont go back unless someone drags me there",
   "creator_id": "test-human"
 }' | python -m json.tool
-
+ 
 # Borderline: lightly edited AI output
 curl -s -X POST http://localhost:5000/submit -H "Content-Type: application/json" -d '{
   "text": "I have been thinking a lot about remote work lately. There are genuine tradeoffs, flexibility and no commute on one side, isolation and blurred work-life boundaries on the other. Studies show productivity varies widely by individual and role type.",
   "creator_id": "test-borderline"
 }' | python -m json.tool
 ```
-
+ 
 ## Transparency Label
-
+ 
 The exact label text returned by the API (with `{score}` substituted as a
 percentage) for each of the three tiers:
-
+ 
 | Tier | Exact label text |
 |---|---|
 | **High-confidence AI** | "This content shows strong signals of AI generation (confidence: {score}). Our system is fairly confident this was produced by an AI tool rather than written by a human." |
 | **High-confidence human** | "This content shows strong signals of human authorship (confidence: {score}). Our system found little evidence of AI generation." |
 | **Uncertain** | "We can't confidently determine whether this content was AI-generated or human-written (confidence: {score}). Treat this attribution as inconclusive." |
-
+ 
 ## Appeals Workflow
-
+ 
 `POST /appeal` with `{content_id, creator_reasoning}`:
-
+ 
 ```bash
 curl -s -X POST http://localhost:5000/appeal -H "Content-Type: application/json" -d '{
   "content_id": "30c1d635-d35f-4fcf-82b5-6d16755323ea",
   "creator_reasoning": "I wrote this myself from personal experience. I am a non-native English speaker and my writing style may appear more formal than typical."
 }' | python -m json.tool
 ```
-
+ 
 **Actual response:**
 ```json
 {
@@ -162,17 +163,17 @@ curl -s -X POST http://localhost:5000/appeal -H "Content-Type: application/json"
     "status": "under_review"
 }
 ```
-
+ 
 This sets the record's `status` to `under_review` and logs the reasoning
 alongside the original decision — no automatic re-classification. A human
 reviewer would filter `GET /log?status=under_review` to see the appeal
 queue: each entry shows the original text preview, both signal scores, the
 combined score, the original label, and the creator's reasoning together.
-
+ 
 ## Rate Limiting
-
+ 
 `10 per minute; 100 per day` on `POST /submit`, via Flask-Limiter.
-
+ 
 **Reasoning:** a real creator submitting their own work for a transparency
 check would rarely need more than a handful of submissions in a sitting
 (draft, revise, resubmit) — 10/minute comfortably covers that while making a
@@ -180,7 +181,7 @@ scripted flood (e.g., probing the classifier with many small variations to
 reverse-engineer thresholds) noticeably slower. The 100/day ceiling caps
 total daily load per client without affecting any realistic single-creator
 workflow.
-
+ 
 **Evidence (12 rapid requests, 10/minute limit):**
 ```
 200
@@ -196,7 +197,7 @@ workflow.
 429
 429
 ```
-
+ 
 ```bash
 for i in $(seq 1 12); do
   curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:5000/submit \
@@ -204,15 +205,15 @@ for i in $(seq 1 12); do
     -d '{"text": "This is a test submission for rate limit testing purposes only.", "creator_id": "ratelimit-test"}'
 done
 ```
-
+ 
 ## Audit Log
-
+ 
 `GET /log` returns the most recent structured entries (JSON, backed by
 SQLite), each containing `content_id`, `creator_id`, `timestamp`,
 `llm_score`, `llm_rationale`, `stylometric_score`, `confidence`,
 `attribution`, `label`, `status`, and (once appealed) `appeal_reasoning` /
 `appeal_timestamp`.
-
+ 
 ```json
 {
     "entries": [
@@ -429,14 +430,73 @@ SQLite), each containing `content_id`, `creator_id`, `timestamp`,
     ]
 }
 ```
-
+ 
 This log includes 15 entries spanning multiple submissions and one appeal
 (`content_id: 30c1d635-...`, `status: under_review`), satisfying the "at
 least 3 entries visible" requirement with real production data rather than
 synthetic examples.
-
+ 
+## Stretch Feature: Analytics Dashboard
+ 
+**What it does:** two new endpoints surface patterns across the audit log
+without any new storage — everything is computed live from the existing
+`audit_log` SQLite table.
+ 
+- `GET /analytics` — returns JSON: total submissions, a breakdown of
+  detection-tier counts/percentages (`likely_ai` / `uncertain` /
+  `likely_human`), average combined confidence score, the appeal rate
+  (`% of entries with status = under_review`), and the **signal
+  disagreement rate** (the additional metric).
+- `GET /dashboard` — a minimal server-rendered HTML page (no JS framework)
+  that fetches the same data and renders it as four summary stat boxes plus
+  a simple bar breakdown by detection tier, so a non-technical reviewer can
+  see it directly in a browser.
+**The additional metric — signal disagreement rate:** the percentage of
+submissions where the LLM signal and the stylometric signal land on opposite
+sides of the 0.5 midpoint (one leans "AI-like," the other leans
+"human-like"). This isn't just a vanity stat — a high disagreement rate is a
+live, data-backed argument for *why* the system uses two signals instead of
+one: it tells a platform operator how often relying on a single signal would
+have given a confidently wrong-feeling answer that the other signal
+contradicts.
+ 
+**Real output from `/analytics`** (captured against the project's own test
+data across all milestones, 14 submissions and 1 appeal so far):
+```json
+{
+    "appeal_count": 1,
+    "appeal_rate": 7.1,
+    "average_confidence": 0.223,
+    "detection_patterns": {
+        "likely_human": {
+            "count": 12,
+            "percentage": 85.7
+        },
+        "uncertain": {
+            "count": 2,
+            "percentage": 14.3
+        }
+    },
+    "signal_disagreement_count": 2,
+    "signal_disagreement_rate": 14.3,
+    "total_submissions": 14
+}
+```
+The signals disagreed on 14.3% of submissions (2 of 14) — concrete evidence
+that a single-signal system would have missed cases the other signal caught,
+validating the multi-signal design decision with real data rather than just
+asserting it. The dataset here skews heavily toward "likely human" because
+most of the manual test inputs used across milestones were the human-written
+ramen review sample reused for rate-limit testing; a more balanced sample of
+inputs would be expected to shift `detection_patterns` accordingly.
+ 
+**Verification:** tested by submitting a mixed batch (clearly AI, clearly
+human, borderline) plus one appeal, then confirming `/analytics` numbers
+matched a manual count from `/log`, and that `/dashboard` rendered correctly
+in a browser with no JS errors.
+ 
 ## Known Limitations
-
+ 
 The stylometric signal is unreliable on very short text (roughly under 40
 words): sentence-length variance and type-token ratio need enough sentences
 and vocabulary to be statistically meaningful, and on a haiku or a one-line
@@ -448,9 +508,9 @@ different in origin — the LLM signal, which is weighted higher (0.65 vs.
 stylometric signal functions more as a secondary corroborating check than an
 independent verdict on short content. This is a structural property of the
 metrics, not a bug we could patch by retuning constants.
-
+ 
 ## Spec Reflection
-
+ 
 Writing out the three exact label strings in `planning.md` *before* touching
 any label-generation code forced an early decision about what "confidence"
 means to a non-technical reader — once that text existed, the threshold
