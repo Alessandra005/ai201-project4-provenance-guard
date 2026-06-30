@@ -199,3 +199,47 @@ the system away from false accusations.
   calling `generate_label` at 0.2, 0.5, 0.9 and confirming all three variants
   appear verbatim, then testing the appeal endpoint updates status and is
   visible via `GET /log`.
+
+## Stretch Feature: Analytics Dashboard
+
+**Goal:** a simple view surfacing detection patterns, appeal rates, and one
+additional metric, built on top of the existing `audit_log` table — no new
+storage needed.
+
+**Metrics to surface:**
+1. **Detection patterns** — count and percentage of submissions in each
+   attribution tier (`likely_ai` / `uncertain` / `likely_human`), plus the
+   average combined confidence score overall.
+2. **Appeal rate** — `(# entries with status = under_review) / (total
+   entries)`, expressed as a percentage, since that's the cleanest proxy for
+   "how often creators dispute a verdict."
+3. **Additional metric — signal disagreement rate:** the percentage of
+   submissions where the LLM signal and stylometric signal land on opposite
+   sides of the midpoint (one says "more AI-like," 0.5+, the other says "more
+   human-like," <0.5). This is a genuinely useful operational metric beyond
+   what the spec asks for: a high disagreement rate would tell a platform
+   operator the two signals are capturing different things often enough that
+   single-signal detection would have been unreliable — i.e., it's a
+   real-time justification for the multi-signal design itself, not just a
+   vanity stat.
+
+**API surface:**
+- `GET /analytics` — returns the three metrics above as JSON, computed live
+  from the `audit_log` table (no caching needed at this scale).
+- `GET /dashboard` — a minimal server-rendered HTML page (no JS framework,
+  no build step) that fetches `/analytics` and renders the numbers as plain
+  text/simple bars, so a non-technical reviewer can see it directly in a
+  browser without needing `curl` or a JSON viewer.
+
+**Implementation plan:** add a `compute_analytics()` helper to `app.py` that
+runs a few `SELECT` aggregate queries against `audit_log` (counts grouped by
+`attribution`, count where `status = 'under_review'`, average confidence,
+and a Python-side pass over rows to compute the disagreement rate since it
+requires comparing two columns per row rather than a single aggregate).
+Both routes reuse this helper so the JSON and HTML views never disagree with
+each other.
+
+**Verification plan:** after building, submit a small mixed batch of AI,
+human, and borderline test inputs (reusing the ones from Milestone 4) plus
+at least one appeal, then check that `/analytics` numbers match a manual
+count from `/log`, and that `/dashboard` renders without error in a browser.
